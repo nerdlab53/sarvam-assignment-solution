@@ -20,39 +20,6 @@ git clone https://github.com/yourusername/einops-scratch.git
 cd einops-scratch
 ```
 
-## Usage
-
-```python
-import numpy as np
-from parser import rearrange
-
-# Create a random tensor
-x = np.random.rand(3, 4, 5)
-
-# Transpose dimensions
-result = rearrange(x, 'a b c -> c b a')
-# Equivalent to: x.transpose(2, 1, 0)
-
-# Merge axes
-result = rearrange(x, 'a b c -> (a b) c')
-# Equivalent to: x.reshape(12, 5)
-
-# Split an axis
-x = np.random.rand(12, 10)
-result = rearrange(x, '(h w) c -> h w c', h=3)
-# Equivalent to: x.reshape(3, 4, 10)
-
-# Repeat an axis
-x = np.random.rand(3, 1, 5)
-result = rearrange(x, 'a 1 c -> a b c', b=4)
-# Equivalent to: np.repeat(x, 4, axis=1)
-
-# Handle batch dimensions with ellipsis
-x = np.random.rand(2, 3, 4, 5)
-result = rearrange(x, '... h w -> ... (h w)')
-# Equivalent to: x.reshape(2, 3, 20)
-```
-
 ## Pattern Syntax
 
 The pattern string follows the format: `input_pattern -> output_pattern`
