@@ -1,359 +1,251 @@
 import numpy as np
 from functools import lru_cache
-from typing import List, Dict, Tuple, Union, Set, Optional
-from einopserr import EinopsError
+from typing import List, Dict, Tuple, Set, Any
+from einopserr import EinopsError, _product
 
 class ParsedExpression:
     """Class to parse and represent expressions in einops patterns."""
     
     def __init__(self, expression: str):
         self.expression = expression.strip()
-        self.identifiers: Set[str] = set()
-        self.composition: List[List[str]] = []
-        self.has_ellipses = False
-        
-        # Split the expression into components
-        parts = []
-        current = ''
-        nesting = 0
+        self.identifiers = set()
+        self.composition = []
+        self.has_ellipsis = False
+        self._parse()
+    
+    def _parse(self):
+        """Parse the expression into composition and identifiers."""
+        if not self.expression:
+            return
+        if self.expression == '...':
+            self.has_ellipsis = True
+            self.composition.append(['...'])
+            self.identifiers.add('...')
+            return
+        stack = []
+        current = ""
+        grouping = []
         
         for char in self.expression:
-            if char == '(' and nesting == 0:
-                if current:
-                    parts.append(current.strip())
-                    current = ''
-                nesting = 1
-                current = '('
-            elif char == '(' and nesting > 0:
-                nesting += 1
+            if char == '(' and not stack:
+                if current.strip():
+                    self.composition.append([current.strip()])
+                    self.identifiers.add(current.strip())
+                    current = ""
+                stack.append('(')
+                grouping = []
+            elif char == '(' and stack:
                 current += char
-            elif char == ')' and nesting == 1:
-                current += ')'
-                parts.append(current.strip())
-                current = ''
-                nesting = 0
-            elif char == ')' and nesting > 0:
-                nesting -= 1
+                stack.append('(')
+            elif char == ')' and len(stack) > 1:
                 current += char
-            elif char == ' ' and nesting == 0:
-                if current:
-                    parts.append(current.strip())
-                    current = ''
+                stack.pop()
+            elif char == ')' and len(stack) == 1:
+                if current.strip():
+                    grouping.append(current.strip())
+                    self.identifiers.add(current.strip())
+                self.composition.append(grouping)
+                self.identifiers.update(grouping)
+                if '...' in grouping:
+                    self.has_ellipsis = True
+                stack.pop()
+                current = ""
+                grouping = []
+            elif char == ' ' and not stack:
+                if current.strip():
+                    self.composition.append([current.strip()])
+                    self.identifiers.add(current.strip())
+                current = ""
+            elif stack and char == ' ':
+                if current.strip():
+                    grouping.append(current.strip())
+                    self.identifiers.add(current.strip())
+                current = ""
             else:
                 current += char
-                
-        if current:
-            parts.append(current.strip())
-        
-        # Process each part
-        for part in parts:
-            if part == '...':
-                self.has_ellipses = True
-                self.composition.append(['...'])
-                self.identifiers.add('...')
-            elif part.startswith('(') and part.endswith(')'):
-                # Parse inner content of parentheses
-                inner_content = part[1:-1].strip()
-                inner_axes = inner_content.split()
-                if not inner_axes:
-                    raise EinopsError(f"Empty parenthesized expression: {part}")
-                    
-                # Check for ellipsis in parentheses
-                if '...' in inner_axes:
-                    self.has_ellipses = True
-                    
-                self.composition.append(inner_axes)
-                self.identifiers.update(inner_axes)
-            else:
-                # Single axis
-                self.composition.append([part])
-                self.identifiers.add(part)
-    
-    def __repr__(self) -> str:
-        return f"ParsedExpression('{self.expression}')"
+        if current.strip():
+            self.composition.append([current.strip()])
+            self.identifiers.add(current.strip())
+        if '...' in self.identifiers:
+            self.has_ellipsis = True
 
 @lru_cache(maxsize=128)
 def parse_pattern(pattern: str) -> Tuple[ParsedExpression, ParsedExpression]:
-    """Parse pattern into left and right parts."""
+    """Parse a pattern string into left and right expressions."""
     if '->' not in pattern:
         raise EinopsError("Pattern must contain '->'")
-        
+    
     left_str, right_str = pattern.split('->')
     left = ParsedExpression(left_str.strip())
     right = ParsedExpression(right_str.strip())
     
-    # Validate ellipsis usage
-    if not left.has_ellipses and right.has_ellipses:
-        raise EinopsError("Ellipsis found in right part but not in left part")
+    if not left.has_ellipsis and right.has_ellipsis:
+        raise EinopsError("Ellipsis found in right side, but not in left side of pattern")
     
     return left, right
 
-def _expand_ellipsis(left: ParsedExpression, right: ParsedExpression, tensor_shape: Tuple[int, ...], 
-                     **axes_lengths) -> Tuple[ParsedExpression, ParsedExpression, List[str]]:
-    """Expand ellipsis in patterns to handle variable dimensional inputs."""
-    # Calculate how many dimensions ellipsis represents
-    n_left_non_ellipsis = sum(1 for group in left.composition if group != ['...'])
-    if len(tensor_shape) < n_left_non_ellipsis:
-        raise EinopsError(f"Wrong shape: expected >={n_left_non_ellipsis} dims, got {len(tensor_shape)}-dim tensor")
+def _expand_ellipsis(left: ParsedExpression, right: ParsedExpression, tensor_shape: Tuple[int, ...]):
+    """Expand ellipsis in patterns to handle batch dimensions."""
+
+    explicit_dims = sum(1 for group in left.composition if '...' not in group)
     
-    ellipsis_ndim = len(tensor_shape) - n_left_non_ellipsis
-    ellipsis_axes = [f'_e{i}' for i in range(ellipsis_ndim)]
+    if len(tensor_shape) < explicit_dims:
+        raise EinopsError(f"Tensor has {len(tensor_shape)} dims, but pattern requires at least {explicit_dims}")
     
-    expanded_left_composition, expanded_right_composition = [], []
+    ellipsis_dims = len(tensor_shape) - explicit_dims
+    ellipsis_axes = [f'_e{i}' for i in range(ellipsis_dims)]
     
-    # Process left side of the pattern
-    left_axis_position = 0
-    for i, composite_axis in enumerate(left.composition):
-        if composite_axis == ['...']:
-            for j, axis in enumerate(ellipsis_axes):
-                expanded_left_composition.append([axis])
-                left_axis_position += 1
-        else:
-            expanded_left_composition.append(composite_axis)
-            left_axis_position += 1
-            
-    # Process right side with special handling for collapsed ellipsis
-    for composite_axis in right.composition:
-        if composite_axis == ['...']:
-            # Regular ellipsis - expand to matching dimensions
+    expanded_left = []
+    for group in left.composition:
+        if len(group) == 1 and group[0] == '...':
             for axis in ellipsis_axes:
-                expanded_right_composition.append([axis])
-        elif '...' in composite_axis:
-            # Collapsed ellipsis like in (...)
-            # Replace with a single flattened dimension that includes all ellipsis axes
+                expanded_left.append([axis])
+        else:
+            expanded_left.append(group)
+    
+    expanded_right = []
+    for group in right.composition:
+        if len(group) == 1 and group[0] == '...':
+            for axis in ellipsis_axes:
+                expanded_right.append([axis])
+        elif '...' in group:
             new_group = []
-            for axis in composite_axis:
+            for axis in group:
                 if axis == '...':
                     new_group.extend(ellipsis_axes)
                 else:
                     new_group.append(axis)
-            expanded_right_composition.append(new_group)
+            expanded_right.append(new_group)
         else:
-            expanded_right_composition.append(composite_axis)
-    
-    # Create new parsed expressions with expanded compositions
-    expanded_left = ParsedExpression(' '.join('(' + ' '.join(group) + ')' if len(group) > 1 else group[0] 
-                                        for group in expanded_left_composition))
-    expanded_right = ParsedExpression(' '.join('(' + ' '.join(group) + ')' if len(group) > 1 else group[0] 
-                                        for group in expanded_right_composition))
+            expanded_right.append(group)
     
     return expanded_left, expanded_right, ellipsis_axes
 
-def _prepare_transform_recipe(tensor: np.ndarray, pattern: str, **axes_lengths) -> Dict:
-    """Prepare the recipe for transformation of tensor."""
-    # Check for empty tensor
-    if tensor.size == 0:
-        raise EinopsError("Cannot rearrange an empty tensor")
-    
-    # Check for zero dimensions
-    if 0 in tensor.shape:
-        raise EinopsError("Cannot rearrange a tensor with zero dimensions")
-    
-    left, right = parse_pattern(pattern)
-    
-    # Handle ellipsis if present
-    if left.has_ellipses:
-        expanded_left, expanded_right, ellipsis_axes = _expand_ellipsis(
-            left, right, tensor.shape, **axes_lengths
-        )
-    else:
-        expanded_left, expanded_right = left, right
-        ellipsis_axes = []
-
-        if len(tensor.shape) != len(expanded_left.composition):
-            raise EinopsError(
-                f"Wrong shape: expected {len(expanded_left.composition)} dims, "
-                f"got {len(tensor.shape)}-dim tensor"
-            )
-    
-    # Map: Name -> Position
-    axis_name_to_position = {}
-    for i, composite_axis in enumerate(expanded_left.composition):
-        for axis in composite_axis:
-            axis_name_to_position[axis] = i
-    
-    # Sanity check for axes_lengths
-    for axis in axes_lengths:
-        if axis not in expanded_left.identifiers and axis not in expanded_right.identifiers:
-            raise EinopsError(f"Axis {axis} provided in axes_lengths is not used in pattern")
-    
-    # Map: Name -> Length
-    axis_lengths = {}
-    for i, group in enumerate(expanded_left.composition):
-        for axis in group:
-            if axis in axes_lengths:
-                axis_lengths[axis] = axes_lengths[axis]
-            else:
-                if len(group) == 1:
-                    axis_lengths[axis] = tensor.shape[i]
-    
-    operations = []
-
-    # Add initial reshape if needed
-    need_initial_reshape = any(len(group) > 1 for group in expanded_left.composition)
-    if need_initial_reshape:
-        init_shape = []
-        for group in expanded_left.composition:
-            if len(group) == 1:
-                init_shape.append(tensor.shape[axis_name_to_position[group[0]]])
-            else:
-                known_product = 1
-                unknown_axes = []
-                for axis in group:
-                    if axis in axes_lengths:
-                        known_product *= axes_lengths[axis]
-                    else:
-                        unknown_axes.append(axis)
-                if len(unknown_axes) > 1:
-                    raise EinopsError(f"Cannot infer sizes for multiple unknown axes: {unknown_axes}")
-                if len(unknown_axes) == 1:
-                    dim_size = tensor.shape[axis_name_to_position[group[0]]]
-                    if dim_size % known_product != 0:
-                        raise EinopsError(
-                            f"Cannot divide axis of length {dim_size} into chunks of {known_product}"
-                        )
-                    axis_lengths[unknown_axes[0]] = dim_size // known_product
-
-                init_shape.append(tensor.shape[axis_name_to_position[group[0]]])
-        operations.append(('reshape', init_shape))
-    else:
-        # Add identity reshape for consistency
-        operations.append(('reshape', list(tensor.shape)))
-
-    # Build flat lists of all axes names from left and right sides
-    input_axes = []
-    for group in expanded_left.composition:
-        for axis in group:
-            if axis not in input_axes:
-                input_axes.append(axis)
-    
-    output_axes = []
-    for group in expanded_right.composition:
-        for axis in group:
-            if axis in input_axes and axis not in output_axes:
-                output_axes.append(axis)
-    
-    # Build permutation for transpose
-    common_axes = [axis for axis in input_axes if axis in output_axes]
-    input_pos = [input_axes.index(axis) for axis in common_axes]
-    output_pos = [output_axes.index(axis) for axis in common_axes]
-    
-    # Check if we need to transpose
-    need_transpose = input_pos != sorted(input_pos)
-    if need_transpose:
-        # Create the permutation
-        permutation = []
-        for axis in output_axes:
-            if axis in input_axes:
-                permutation.append(input_axes.index(axis))
-        
-        operations.append(('transpose', permutation))
-    
-    # Special handling for ellipsis dimensions in axis_lengths
-    for i, axis in enumerate(ellipsis_axes):
-        if axis not in axis_lengths:
-            ellipsis_position = axis_name_to_position.get(axis)
-            if ellipsis_position is not None:
-                axis_lengths[axis] = tensor.shape[ellipsis_position]
-    
-    # Final reshape
-    final_shape = []
-    for group in expanded_right.composition:
-        if len(group) == 1:
-            # Single axis
+def _get_input_axes_lengths(tensor_shape: Tuple[int, ...], left_composition: List[List[str]], 
+                            axes_lengths: Dict[str, int]) -> Dict[str, int]:
+    """Determine the length of each axis in the input pattern."""
+    result = dict(axes_lengths)
+    for i, group in enumerate(left_composition):
+        if len(group) == 1 and group[0] != '...':
             axis = group[0]
-            if axis in axis_lengths:
-                final_shape.append(axis_lengths[axis])
-            else:
-                # Try to find the axis in the left side
-                if axis in axis_name_to_position:
-                    final_shape.append(tensor.shape[axis_name_to_position[axis]])
+            if axis not in result:
+                if axis.isdigit():
+                    result[axis] = int(axis)
                 else:
-                    # Check if this is a repeated axis (like 'b' in 'a 1 c -> a b c')
-                    # Look for a corresponding '1' in the input pattern
-                    for i, input_group in enumerate(expanded_left.composition):
-                        if len(input_group) == 1 and input_group[0] == '1':
-                            # Found a '1' in the input, check if it's in the right position
-                            if i == len(expanded_left.composition) - 1 or i == 0:
-                                # This is a simple case, the '1' is at the beginning or end
-                                if axis in axes_lengths:
-                                    final_shape.append(axes_lengths[axis])
-                                    break
-                            else:
-                                # This is a more complex case, the '1' is in the middle
-                                # We need to check if the output axis is adjacent to the '1'
-                                if axis in axes_lengths:
-                                    final_shape.append(axes_lengths[axis])
-                                    break
-                    else:
-                        raise EinopsError(f"Cannot determine size for axis {axis} in output shape")
-        else:
-            # Multiple axes in parentheses
-            dim_size = 1
+                    result[axis] = tensor_shape[i]
+    
+    for i, group in enumerate(left_composition):
+        if len(group) > 1:
+            total_length = tensor_shape[i]
+            known_product = 1
+            unknown_axes = []
+            
             for axis in group:
-                if axis not in axis_lengths:
-                    raise EinopsError(f"Cannot determine size for axis {axis} in output shape")
-                dim_size *= axis_lengths[axis]
-            final_shape.append(dim_size)
+                if axis in result:
+                    known_product *= result[axis]
+                else:
+                    unknown_axes.append(axis)
+            
+            if len(unknown_axes) == 0:
+                if total_length != known_product:
+                    raise EinopsError(f"Shape mismatch: {total_length} != {known_product}")
+            elif len(unknown_axes) == 1:
+                if total_length % known_product != 0:
+                    raise EinopsError(f"Cannot divide {total_length} by {known_product}")
+                result[unknown_axes[0]] = total_length // known_product
+            else:
+                raise EinopsError(f"Cannot infer multiple unknown axes in {group}")
     
-    operations.append(('reshape', final_shape))
-    
-    return {
-        'operations': operations,
-        'axis_lengths': axis_lengths,
-        'left': expanded_left,
-        'right': expanded_right
-    }
+    return result
 
-def rearrange(tensor: np.ndarray, pattern: str, **axes_lengths) -> np.ndarray:
+def rearrange(tensor: np.ndarray, pattern: str, **axes_lengths: int) -> np.ndarray:
     """
-    Rearrange tensor dimensions according to the pattern.
+    Rearrange elements of a tensor according to the pattern.
     
-    This function performs einops-like tensor dimension rearrangement based on the pattern string.
-    It supports reshaping, transposition, splitting of axes, merging of axes, and handling of
-    ellipsis for batch dimensions.
+    This operation includes functionality of transpose (axes permutation), reshape (view),
+    squeeze, unsqueeze, stack, and repeat operations.
     
     Args:
-        tensor: NumPy ndarray to be rearranged
-        pattern: String pattern specifying rearrangement (e.g., 'b c h w -> b (h w) c')
-        **axes_lengths: Named axis lengths for axes in the pattern
+        tensor: numpy.ndarray, tensor to be rearranged
+        pattern: str, rearrangement pattern in einops notation, e.g. 'b c h w -> b (h w) c'
+        **axes_lengths: keyword arguments for axes sizes
     
     Returns:
-        Rearranged numpy array
+        numpy.ndarray with rearranged elements
     
-    Examples:
-        # Transpose dimensions
-        >>> x = np.random.rand(3, 4)
-        >>> rearrange(x, 'h w -> w h').shape
-        (4, 3)
-        
-        # Split an axis
-        >>> x = np.random.rand(12, 10)
-        >>> rearrange(x, '(h w) c -> h w c', h=3).shape
-        (3, 4, 10)
-        
-        # Merge axes
-        >>> x = np.random.rand(3, 4, 5)
-        >>> rearrange(x, 'a b c -> (a b) c').shape
-        (12, 5)
-        
-        # Handle batch dimensions
-        >>> x = np.random.rand(2, 3, 4, 5)
-        >>> rearrange(x, '... h w -> ... (h w)').shape
-        (2, 3, 20)
+    Raises:
+        EinopsError: if pattern is invalid or tensor shape doesn't match pattern
     """
     try:
-        recipe = _prepare_transform_recipe(tensor, pattern, **axes_lengths)
+        if tensor.size == 0:
+            raise EinopsError("Cannot rearrange empty tensor")
+        if 0 in tensor.shape:
+            raise EinopsError("Cannot rearrange tensor with zero-sized dimensions")
+        left, right = parse_pattern(pattern)
+        if left.has_ellipsis:
+            expanded_left, expanded_right, ellipsis_axes = _expand_ellipsis(left, right, tensor.shape)
+        else:
+            if len(tensor.shape) != len(left.composition):
+                raise EinopsError(f"Wrong shape: expected {len(left.composition)} dims, got {len(tensor.shape)}-dim tensor")
+            expanded_left = left.composition
+            expanded_right = right.composition
+            ellipsis_axes = []
+        for axis_name in axes_lengths:
+            if axis_name not in left.identifiers and axis_name not in right.identifiers:
+                raise EinopsError(f"Axis {axis_name} provided in axes_lengths is not used in pattern")
+        axes_lengths_dict = _get_input_axes_lengths(tensor.shape, expanded_left, axes_lengths)
+        need_initial_reshape = any(len(group) > 1 for group in expanded_left)
         
-        result = tensor
-        for op_type, op_params in recipe['operations']:
-            if op_type == 'reshape':
-                result = result.reshape(op_params)
-            elif op_type == 'transpose':
-                result = result.transpose(op_params)
+        if need_initial_reshape:
+            init_shape = []
+            for i, group in enumerate(expanded_left):
+                if len(group) == 1:
+                    init_shape.append(tensor.shape[i])
+                else:
+                    for axis in group:
+                        init_shape.append(axes_lengths_dict[axis])
+            tensor = tensor.reshape(init_shape)
         
-        return result
-    
+        flat_left = []
+        for group in expanded_left:
+            flat_left.extend(group)
+            
+        flat_right = []
+        for group in expanded_right:
+            flat_right.extend(group)
+
+        repeat_axes = [axis for axis in flat_right if axis not in flat_left]
+        
+        for axis in repeat_axes:
+            if axis not in axes_lengths_dict:
+                raise EinopsError(f"Size not provided for new axis: {axis}")
+            tensor = np.expand_dims(tensor, -1)
+            flat_left.append(axis)
+        
+        if flat_left != flat_right:
+            axis_to_position = {axis: i for i, axis in enumerate(flat_left)}
+            permutation = [axis_to_position[axis] for axis in flat_right if axis in axis_to_position]
+            if permutation != list(range(len(permutation))):
+                tensor = np.transpose(tensor, permutation)
+        
+        for axis in repeat_axes:
+            axis_idx = flat_right.index(axis)
+            repeat_count = axes_lengths_dict[axis]
+            tensor = np.repeat(tensor, repeat_count, axis=axis_idx)
+        
+        final_shape = []
+        for group in expanded_right:
+            if len(group) == 1:
+                axis = group[0]
+                final_shape.append(axes_lengths_dict[axis])
+            else:
+                product = 1
+                for axis in group:
+                    product *= axes_lengths_dict[axis]
+                final_shape.append(product)
+        
+        return tensor.reshape(final_shape)
+        
     except EinopsError as e:
         message = f"Error during rearrange with pattern '{pattern}'.\n"
         message += f"Input tensor shape: {tensor.shape}.\n"
